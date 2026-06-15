@@ -1,12 +1,15 @@
 """
-Crypto Intelligence Bot v10 - HIGH ACCURACY
+Crypto Intelligence Bot v11 - HIGH ACCURACY
 Key improvements:
 - Fixed predicted ranges (no negative prices, realistic bounds)
 - Multi-timeframe confluence scoring
 - Better signal logic with confirmation filters
 - Accurate futures setup with proper R/R
-- Real news research via Groq
 - Smarter ATR-based range calculation
+- REAL news via CryptoPanic (replaces hallucinated AI news)
+- Groq AI repurposed as a DECISION LAYER: judges the quant signal
+  against real news and gives a final AGREE/ADJUST/OVERRIDE call
+  with refined spot/futures trade setups
 """
 import logging
 import asyncio
@@ -25,6 +28,7 @@ from telegram.ext import (
 
 TELEGRAM_TOKEN = "8650706334:AAHJQrBxkw-zOw286H1v-PvtDtUWsM9KFfY"
 GROQ_API_KEY   = "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"
+CRYPTOPANIC_KEY = "c8b70bac4af818456fa3ba7f62a60eb1804f60cc"
 ALLOWED_CHAT   = 5214099942
 
 logging.basicConfig(format="%(asctime)s - %(levelname)s - %(message)s", level=logging.INFO)
@@ -34,6 +38,7 @@ SPOT = "https://api.binance.com"
 FUT  = "https://fapi.binance.com"
 GROQ = "https://api.groq.com/openai/v1/chat/completions"
 FNG  = "https://api.alternative.me/fng/?limit=1"
+CRYPTOPANIC = "https://cryptopanic.com/api/v1/posts/"
 
 CG_IDS = {
     "BTC":"bitcoin","ETH":"ethereum","SOL":"solana","BNB":"binancecoin",
@@ -74,6 +79,53 @@ async def post(session, url, headers, body, timeout=45):
     except Exception as e:
         logger.debug(f"POST {url[:45]}: {e}")
     return None
+
+# ─── NEWS (CryptoPanic) ────────────────────────────────────────────────────────
+async def cryptopanic_news(session, coin):
+    """
+    Fetch REAL recent news for a coin from CryptoPanic.
+    Returns a list of dicts: title, sentiment (from community votes), source, date, important.
+    """
+    params = {
+        "auth_token": CRYPTOPANIC_KEY,
+        "currencies": coin,
+        "public": "true",
+        "kind": "news",
+    }
+    data = await get(session, CRYPTOPANIC, params, timeout=10)
+    if not data or not isinstance(data, dict) or "results" not in data:
+        return []
+
+    news = []
+    for item in data["results"][:10]:
+        title = item.get("title", "").strip()
+        if not title:
+            continue
+        votes = item.get("votes", {}) or {}
+        pos = votes.get("positive", 0) or 0
+        neg = votes.get("negative", 0) or 0
+        liked = votes.get("liked", 0) or 0
+        disliked = votes.get("disliked", 0) or 0
+        important = (votes.get("important", 0) or 0) > 0
+
+        bull_score = pos + liked
+        bear_score = neg + disliked
+        if bull_score > bear_score * 1.3 and bull_score > 0:
+            sent = "bullish"
+        elif bear_score > bull_score * 1.3 and bear_score > 0:
+            sent = "bearish"
+        else:
+            sent = "neutral"
+
+        src = (item.get("source") or {}).get("title", "")
+        pub = (item.get("published_at") or "")[:10]
+        url = item.get("url", "")
+
+        news.append({
+            "title": title, "sentiment": sent, "source": src,
+            "date": pub, "important": important, "url": url,
+        })
+    return news
 
 # ─── INDICATORS ───────────────────────────────────────────────────────────────
 def ema(closes, p):
@@ -504,29 +556,43 @@ def futures_setup(price, direction, i1h, i4h, i1d, fr_val=0):
         "rr": rr,
     }
 
-# ─── GROQ AI ──────────────────────────────────────────────────────────────────
-async def groq_ai(session, coin, ctx):
-    prompt = f"""You are a professional crypto trader with 10 years experience. You have real knowledge about {coin} and the crypto market.
+# ─── GROQ AI — DECISION LAYER ─────────────────────────────────────────────────
+async def groq_ai(session, coin, ctx, news):
+    if news:
+        news_lines = []
+        for n in news[:8]:
+            tag = "⭐" if n.get("important") else ""
+            news_lines.append(f"- [{n['sentiment'].upper()}]{tag} {n['title']} ({n.get('source','')}, {n.get('date','')})")
+        news_text = "\n".join(news_lines)
+    else:
+        news_text = "No recent news found for this coin on CryptoPanic."
 
-LIVE MARKET DATA FOR {coin}/USDT:
+    prompt = f"""You are a senior crypto trading strategist making the FINAL call on a trade.
+
+You are given two things — do NOT regenerate either of them:
+1) QUANT DATA: a complete multi-timeframe technical analysis already computed precisely (scores, RSI, EMAs, MACD, ATR, support/resistance, predicted ranges, and a baseline spot/futures trade setup with real entry/SL/TP numbers).
+2) REAL NEWS: actual recent headlines for {coin} pulled from CryptoPanic, each tagged with community sentiment votes.
+
+QUANT DATA FOR {coin}/USDT:
 {json.dumps(ctx, default=str)}
 
-Your task: Provide ACCURATE, SPECIFIC analysis. Do NOT give generic answers.
+REAL NEWS (CryptoPanic, last few days):
+{news_text}
 
-IMPORTANT:
-- News must be about REAL recent events for {coin} — partnerships, protocol upgrades, listings, whale moves, regulatory news
-- Price targets must use actual numbers from the data
-- Signals must match the technical data provided
+YOUR JOB — decision-making, not re-analysis:
+- Weigh the REAL news against the quant signal. Does it CONFIRM, WEAKEN, or CONTRADICT the technical picture?
+- Make the FINAL trading call: verdict is AGREE (news supports/doesn't change quant signal), ADJUST (tweak confidence or levels slightly), or OVERRIDE (news is decisive enough to flip/cancel the trade)
+- For spot/futures setups: start from the quant baseline entry/sl/tp1/tp2 given in QUANT DATA. Only change numbers if you have a clear reason (e.g. a key level from news, or risk-off override). Otherwise copy the baseline numbers as-is.
+- key_news: select ONLY from the REAL NEWS list above (max 3), do not invent any news. If the list is empty, return an empty array.
+- Be concise and specific. Reference actual numbers from QUANT DATA in your reasoning.
 
-Reply ONLY with this exact JSON (no markdown, no extra text):
-{{"news":[{{"h":"Real specific news headline about {coin}","d":"~Jun 2026","s":"bullish/bearish/neutral","i":"specific market impact"}}],"sentiment":"BULLISH/BEARISH/NEUTRAL","score":5,"context":"Specific macro context with real numbers","short":{{"dir":"BULLISH/BEARISH/NEUTRAL","conf":65,"t_low":0.0,"t_high":0.0,"sup":0.0,"res":0.0,"why":["specific reason with numbers","specific reason","specific reason"]}},"long":{{"dir":"BULLISH/BEARISH/NEUTRAL","conf":55,"t_low":0.0,"t_high":0.0,"why":["reason","reason","reason"]}},"pumps":["specific catalyst with condition","specific catalyst","specific catalyst","specific catalyst"],"dumps":["specific risk with level","specific risk","specific risk","specific risk"],"spot_action":"BUY/SELL/HOLD","spot_entry":0.0,"spot_sl":0.0,"spot_tp1":0.0,"spot_tp2":0.0,"spot_why":"specific reason based on data","fut_dir":"LONG/SHORT/NO TRADE","fut_why":"specific reason","fut_invalid":"Trade invalid if price closes {"{direction}"} $X","risk":"LOW/MEDIUM/HIGH/VERY HIGH","risk_why":"specific reason with data"}}
-
-Fill ALL price fields with real numbers from the provided data. news array must have 4 items."""
+Reply ONLY with this exact JSON (no markdown, no extra text, no commentary):
+{{"verdict":"AGREE/ADJUST/OVERRIDE","final_action":"STRONG BUY/BUY/HOLD/SELL/STRONG SELL","final_confidence":0,"reasoning":"2-3 sentences combining technicals + news","news_sentiment":"BULLISH/BEARISH/NEUTRAL/MIXED","key_news":[{{"title":"exact headline from REAL NEWS list","sentiment":"bullish/bearish/neutral","impact":"why it matters for price, 1 sentence"}}],"spot":{{"action":"BUY/SELL/HOLD","entry":0.0,"sl":0.0,"tp1":0.0,"tp2":0.0,"reasoning":"1-2 sentences"}},"futures":{{"direction":"LONG/SHORT/NO TRADE","entry":0.0,"sl":0.0,"tp1":0.0,"tp2":0.0,"invalidation":"specific price condition","reasoning":"1-2 sentences"}},"risk_level":"LOW/MEDIUM/HIGH/EXTREME","risk_factors":["factor with number","factor","factor"],"catalysts_watch":["upcoming catalyst or level to watch","catalyst"]}}"""
 
     h={"Authorization":f"Bearer {GROQ_API_KEY}","Content-Type":"application/json"}
     b={"model":"llama-3.3-70b-versatile",
        "messages":[{"role":"user","content":prompt}],
-       "max_tokens":1400,"temperature":0.25}
+       "max_tokens":1200,"temperature":0.15}
     resp=await post(session, GROQ, h, b, timeout=45)
     if not resp or "choices" not in resp:
         return None
@@ -588,6 +654,8 @@ async def analyze(coin_raw):
             get(s,f"{SPOT}/api/v3/ticker/24hr",{"symbol":"BTCUSDT"}),
             get(s,f"{SPOT}/api/v3/ticker/24hr",{"symbol":"ETHUSDT"}),
             get(s,FNG,timeout=6),
+            # Real news
+            cryptopanic_news(s,coin),
             return_exceptions=True
         )
 
@@ -601,6 +669,7 @@ async def analyze(coin_raw):
         ki1d=safe(results[10],list); ki1w=safe(results[11],list)
         btc_t=safe(results[12],dict); eth_t=safe(results[13],dict)
         fg=safe(results[14],dict)
+        news=safe(results[15],list) or []
 
         if fut_t:    price=float(fut_t.get("lastPrice",0))
         elif spot_t: price=float(spot_t.get("lastPrice",0))
@@ -634,7 +703,7 @@ async def analyze(coin_raw):
         at4h=i4h.get("at") or 0
         vol_lbl="HIGH" if at4h/price*100>3 else ("MEDIUM" if at4h/price*100>1.5 else "LOW") if price else "N/A"
 
-        # Groq context
+        # Groq context — full quant picture so the AI judges/decides rather than re-derives
         ctx={
             "coin":coin,"price":price,
             "change_24h":float(spot_t.get("priceChangePercent",0)) if spot_t else 0,
@@ -651,15 +720,25 @@ async def analyze(coin_raw):
             "bb_lower_4h":i4h.get("bl"),"bb_upper_4h":i4h.get("bu"),
             "atr_4h":at4h,"volatility":vol_lbl,
             "score_1h":s1h,"score_4h":s4h,"score_1d":s1d,"weighted_score":round(weighted,2),
-            "confluence_action":action,"confidence":conf,
-            "spot_signal":action,"futures_signal":fut_dir,
-            "spot_entry":price,"spot_sl":ss["sl"],"spot_tp1":ss["tp1"],
+            "confluence_action":action,"confidence":conf,"confluence_reasons":reasons,
+            "support_1d":i1d.get("bl"),"resistance_1d":i1d.get("bu"),
+            "support_4h":i4h.get("bl"),"resistance_4h":i4h.get("bu"),
             "btc_change":float(btc_t.get("priceChangePercent",0)) if btc_t else 0,
             "btc_price":float(btc_t.get("lastPrice",0)) if btc_t else 0,
             "fear_greed":fg["data"][0]["value"] if fg and "data" in fg else "N/A",
             "predicted_ranges":{k:{"h":v["h"],"l":v["l"],"mp":v["mp"]} for k,v in rngs.items()},
+            # Baseline trade setups computed from quant signals — Groq should refine, not replace
+            "baseline_spot":{
+                "action":action,"entry":ss["entry"],"sl":ss["sl"],
+                "tp1":ss["tp1"],"tp2":ss["tp2"],"tp3":ss["tp3"],"rr":ss["rr"],
+            },
+            "baseline_futures": ({
+                "direction":fs["direction"],"entry":fs["entry"],"sl":fs["sl"],
+                "tp1":fs["tp1"],"tp2":fs["tp2"],"tp3":fs["tp3"],
+                "liq":fs["liq"],"liq_dist_pct":fs["liq_dist"],"rr":fs["rr"],
+            } if fs else {"direction":"NO TRADE"}),
         }
-        ai=await groq_ai(s,coin,ctx)
+        ai=await groq_ai(s,coin,ctx,news)
 
     # ── FORMAT PAGES ──────────────────────────────────────────────────────────
     pages=[]
@@ -667,7 +746,7 @@ async def analyze(coin_raw):
     # PAGE 1 — Overview + Price + Ranges
     p1=[]
     p1.append("━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
-    p1.append(f"🪙 *{coin}/USDT — Intelligence v10*")
+    p1.append(f"🪙 *{coin}/USDT — Intelligence v11*")
     p1.append(f"🕐 `{now}`")
     p1.append("━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
 
@@ -834,67 +913,82 @@ async def analyze(coin_raw):
 
     pages.append("\n".join(p2))
 
-    # PAGE 3 — Groq AI
+    # PAGE 3 — Real News + AI Decision Layer
     p3=[]
     p3.append("━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
-    p3.append("🤖 *GROQ AI — DEEP ANALYSIS*")
+    p3.append("📰 *LATEST NEWS (CryptoPanic)*")
+    p3.append("━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
+
+    if news:
+        for n in news[:5]:
+            se="🟢" if n["sentiment"]=="bullish" else("🔴" if n["sentiment"]=="bearish" else"🟡")
+            star="⭐" if n.get("important") else ""
+            p3.append(f"\n{se}{star} *{n['title']}*")
+            meta=" • ".join(x for x in [n.get("source",""), n.get("date","")] if x)
+            if meta: p3.append(f"  _{meta}_")
+    else:
+        p3.append("\n_No recent news found for this coin._")
+
+    p3.append("\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
+    p3.append("🤖 *AI DECISION LAYER (Groq)*")
     p3.append("━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
 
     if ai:
-        p3.append("\n📰 *LATEST NEWS*")
-        for n in ai.get("news",[])[:4]:
-            se="🟢" if n.get("s")=="bullish" else("🔴" if n.get("s")=="bearish" else"🟡")
-            p3.append(f"  {se} *{n.get('h','N/A')}*")
-            if n.get("i"): p3.append(f"     _{n.get('d','')}_ → {n['i']}")
+        verdict=ai.get("verdict","N/A")
+        ve="✅" if verdict=="AGREE" else("✏️" if verdict=="ADJUST" else("⛔" if verdict=="OVERRIDE" else"🤖"))
+        fa=ai.get("final_action","N/A"); fconf=ai.get("final_confidence",0)
+        ae3="🟢" if "BUY" in fa else("🔴" if "SELL" in fa else"🟡")
+        p3.append(f"\n{ve} *Verdict: {verdict}*")
+        p3.append(f"{ae3} *Final Call: {fa}* — Confidence: `{fconf}%`")
+        if ai.get("reasoning"): p3.append(f"\n_{ai['reasoning']}_")
 
-        sent=ai.get("sentiment","N/A"); ss2=ai.get("score",5)
-        se2="🟢" if sent=="BULLISH" else("🔴" if sent=="BEARISH" else"🟡")
-        p3.append(f"\n📊 *SENTIMENT: {se2} {sent}* ({ss2}/10)")
-        if ai.get("context"): p3.append(f"  _{ai['context']}_")
+        ns=ai.get("news_sentiment","N/A")
+        nse="🟢" if ns=="BULLISH" else("🔴" if ns=="BEARISH" else("🟠" if ns=="MIXED" else"🟡"))
+        p3.append(f"\n📊 *News Sentiment: {nse} {ns}*")
 
-        sh=ai.get("short",{})
-        p3.append(f"\n⏱ *SHORT TERM (24-72h)*")
-        p3.append(f"  *{sh.get('dir','N/A')}* — `{sh.get('conf',0)}%` confidence")
-        if sh.get("t_low") and float(sh.get("t_low",0))>0:
-            p3.append(f"  Target: `${fmt(sh.get('t_low'),4)}` — `${fmt(sh.get('t_high'),4)}`")
-        if sh.get("sup") and float(sh.get("sup",0))>0:
-            p3.append(f"  Sup: `${fmt(sh.get('sup'),6)}`  Res: `${fmt(sh.get('res'),6)}`")
-        for r in sh.get("why",[]):
-            p3.append(f"  • {r}")
+        kn=ai.get("key_news",[])
+        if kn:
+            p3.append("\n🔍 *Key News Impact*")
+            for n in kn[:3]:
+                se="🟢" if n.get("sentiment")=="bullish" else("🔴" if n.get("sentiment")=="bearish" else"🟡")
+                p3.append(f"  {se} *{n.get('title','')[:70]}*")
+                if n.get("impact"): p3.append(f"     _{n['impact']}_")
 
-        lg=ai.get("long",{})
-        p3.append(f"\n📅 *LONG TERM (1-4 weeks)*")
-        p3.append(f"  *{lg.get('dir','N/A')}* — `{lg.get('conf',0)}%` confidence")
-        if lg.get("t_low") and float(lg.get("t_low",0))>0:
-            p3.append(f"  Target: `${fmt(lg.get('t_low'),4)}` — `${fmt(lg.get('t_high'),4)}`")
-        for r in lg.get("why",[]): p3.append(f"  • {r}")
+        # AI Spot setup
+        sp=ai.get("spot",{})
+        sa=sp.get("action","N/A")
+        ae4="🟢" if sa=="BUY" else("🔴" if sa=="SELL" else"🟡")
+        p3.append(f"\n📈 *FINAL SPOT: {ae4} {sa}*")
+        if sp.get("entry") and float(sp.get("entry",0))>0:
+            p3.append(f"  Entry: `${fmt(sp.get('entry'),6)}`  SL: `${fmt(sp.get('sl'),6)}`")
+            p3.append(f"  TP1: `${fmt(sp.get('tp1'),6)}`  TP2: `${fmt(sp.get('tp2'),6)}`")
+        if sp.get("reasoning"): p3.append(f"  _{sp['reasoning']}_")
 
-        p3.append(f"\n🚀 *PUMP CATALYSTS*")
-        for i,c in enumerate(ai.get("pumps",[])[:4],1): p3.append(f"  {i}. {c}")
-        p3.append(f"\n💥 *DUMP RISKS*")
-        for i,r in enumerate(ai.get("dumps",[])[:4],1): p3.append(f"  {i}. {r}")
+        # AI Futures setup
+        fdir=ai.get("futures",{}).get("direction","N/A")
+        fu=ai.get("futures",{})
+        fe4="🟢" if fdir=="LONG" else("🔴" if fdir=="SHORT" else"🚫")
+        p3.append(f"\n🔴 *FINAL FUTURES: {fe4} {fdir}* (25x)")
+        if fdir!="NO TRADE" and fu.get("entry") and float(fu.get("entry",0))>0:
+            p3.append(f"  ⚠️ _Max 2% of account — extreme risk_")
+            p3.append(f"  Entry: `${fmt(fu.get('entry'),6)}`  SL: `${fmt(fu.get('sl'),6)}`")
+            p3.append(f"  TP1: `${fmt(fu.get('tp1'),6)}`  TP2: `${fmt(fu.get('tp2'),6)}`")
+            if fu.get("invalidation"): p3.append(f"  Invalidation: _{fu['invalidation']}_")
+        if fu.get("reasoning"): p3.append(f"  _{fu['reasoning']}_")
 
-        # AI Trade recs with actual numbers
-        sa=ai.get("spot_action","N/A")
-        ae3="🟢" if sa=="BUY" else("🔴" if sa=="SELL" else"🟡")
-        p3.append(f"\n📈 *AI SPOT: {ae3} {sa}*")
-        if ai.get("spot_entry") and float(ai.get("spot_entry",0))>0:
-            p3.append(f"  Entry: `${fmt(ai.get('spot_entry'),6)}`  SL: `${fmt(ai.get('spot_sl'),6)}`  TP1: `${fmt(ai.get('spot_tp1'),6)}`")
-        if ai.get("spot_why"): p3.append(f"  _{ai['spot_why']}_")
-
-        fd2=ai.get("fut_dir","N/A")
-        fe4="🟢" if fd2=="LONG" else("🔴" if fd2=="SHORT" else"🚫")
-        p3.append(f"\n🔴 *AI FUTURES: {fe4} {fd2}* (25x)")
-        p3.append(f"  ⚠️ _Max 2% of account — extreme risk_")
-        if ai.get("fut_why"):    p3.append(f"  _{ai['fut_why']}_")
-        if ai.get("fut_invalid"): p3.append(f"  Invalidation: _{ai['fut_invalid']}_")
-
-        rl=ai.get("risk","N/A")
+        rl=ai.get("risk_level","N/A")
         re2="🟢" if rl=="LOW" else("🟡" if rl=="MEDIUM" else("🔴" if rl=="HIGH" else"🚨"))
         p3.append(f"\n⚠️ *RISK: {re2} {rl}*")
-        if ai.get("risk_why"): p3.append(f"  {ai['risk_why']}")
+        for r in ai.get("risk_factors",[])[:3]:
+            p3.append(f"  • {r}")
+
+        cw=ai.get("catalysts_watch",[])
+        if cw:
+            p3.append(f"\n👀 *CATALYSTS TO WATCH*")
+            for c in cw[:3]:
+                p3.append(f"  • {c}")
     else:
-        p3.append("\n⚠️ Groq AI unavailable — technical analysis above is still valid")
+        p3.append("\n⚠️ AI decision layer unavailable — quant trade setups on the previous page are still valid")
 
     p3.append("\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
     p3.append("⚠️ _Not financial advice. 25x = extreme risk. DYOR._")
@@ -909,23 +1003,22 @@ async def handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if cmd.lower() in ("start","help"):
         await update.message.reply_text(
-            "👋 *Crypto Intelligence Bot v10*\n\n"
+            "👋 *Crypto Intelligence Bot v11*\n\n"
             "Type `/` + any coin:\n"
             "• `/BTC` `/ETH` `/SOL` `/PEPE`\n\n"
-            "✅ *Key improvements v10:*\n"
+            "✅ *Key improvements v11:*\n"
             "• Confluence scoring (3 TF agreement)\n"
-            "• Fixed price ranges (no negatives)\n"
-            "• Better SL/TP using ATR + BB levels\n"
+            "• ATR/BB-based SL/TP with R/R\n"
             "• Futures buffer-to-liquidation shown\n"
-            "• Weighted signal confidence %\n"
-            "• Cleaner Groq AI with real numbers\n\n"
+            "• REAL news via CryptoPanic (no hallucinated news)\n"
+            "• Groq AI is now a decision layer — judges quant signal vs real news and gives a final call (AGREE/ADJUST/OVERRIDE)\n\n"
             "3 messages — full intelligence report",
             parse_mode="Markdown")
         return
 
     if not cmd: return
     msg=await update.message.reply_text(
-        f"⏳ *{cmd.upper()}/USDT Analysis v10*\n_~20 seconds_",
+        f"⏳ *{cmd.upper()}/USDT Analysis v11*\n_~20 seconds_",
         parse_mode="Markdown")
     try:
         pages=await analyze(cmd)
@@ -944,7 +1037,7 @@ def main():
     app.add_handler(CommandHandler("start",handler))
     app.add_handler(CommandHandler("help",handler))
     app.add_handler(MessageHandler(filters.COMMAND,handler))
-    logger.info("🚀 Crypto Intelligence Bot v10 started!")
+    logger.info("🚀 Crypto Intelligence Bot v11 started!")
     app.run_polling(allowed_updates=Update.ALL_TYPES)
 
 if __name__=="__main__":
