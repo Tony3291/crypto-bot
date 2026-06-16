@@ -1,5 +1,5 @@
 """
-Crypto Intelligence Bot v11 - HIGH ACCURACY
+Crypto Intelligence Bot v12 - HIGH ACCURACY
 Key improvements:
 - Fixed predicted ranges (no negative prices, realistic bounds)
 - Multi-timeframe confluence scoring
@@ -10,6 +10,9 @@ Key improvements:
 - Groq AI repurposed as a DECISION LAYER: judges the quant signal
   against real news and gives a final AGREE/ADJUST/OVERRIDE call
   with refined spot/futures trade setups
+- LIQUIDITY HUNT ENGINE: detects short/long squeeze setups,
+  liquidity sweeps below support / above resistance, estimates
+  liquidation cluster magnets, detects SMC order blocks (v12)
 """
 import logging
 import asyncio
@@ -367,7 +370,244 @@ def confluence_signal(s1h, s4h, s1d, i4h, i1d, fr_val=0):
 
     return action, conf, reasons, weighted
 
-# ─── IMPROVED PREDICTED RANGES ────────────────────────────────────────────────
+# ─── LIQUIDATION HUNT & SQUEEZE DETECTION ────────────────────────────────────
+def liquidity_analysis(price, i1h, i4h, i1d, ki1h, ki4h,
+                        fr_val=0, ls_data=None, oih=None, taker=None, fund=None):
+    """
+    Detects the strategy shown in the Coinglass Liquidation Heatmap approach:
+    1. Liquidity Sweep — price sweeping below/above key level then reversing
+    2. Liquidation Magnet — estimating where dense clusters sit (based on recent
+       price structure + ATR, since we don't have Coinglass API)
+    3. Short/Long Squeeze Potential — from funding, L/S ratio, OI trend, taker flow
+    4. SMC Order Block — identifying the nearest untested OB from klines
+    Returns a dict of findings.
+    """
+    import math
+    result = {
+        "squeeze_type": None,        # "SHORT_SQUEEZE", "LONG_SQUEEZE", None
+        "squeeze_score": 0,          # 0-10
+        "squeeze_reasons": [],
+        "sweep_detected": None,      # "BELOW_SUPPORT" / "ABOVE_RESISTANCE" / None
+        "sweep_reasons": [],
+        "liq_clusters_above": [],    # estimated price levels with heavy shorts liquidating
+        "liq_clusters_below": [],    # estimated price levels with heavy longs liquidating
+        "order_block": None,         # nearest SMC order block info
+        "setup_label": "NO SETUP",   # human-readable pattern name
+        "setup_confidence": 0,
+    }
+    if not price or price <= 0:
+        return result
+
+    # ── 1. SQUEEZE SCORING ────────────────────────────────────────────────────
+    sq = 0; sq_r = []
+
+    long_pct = 50.0
+    if ls_data and isinstance(ls_data, list) and ls_data:
+        long_pct = float(ls_data[0].get("longAccount", 0.5)) * 100
+    short_pct = 100 - long_pct
+
+    # Extreme long/short positioning
+    if short_pct > 60:
+        sq += 3; sq_r.append(f"Shorts dominate L/S: {short_pct:.1f}% — squeeze fuel")
+    elif short_pct > 55:
+        sq += 2; sq_r.append(f"Short heavy: {short_pct:.1f}%")
+    elif long_pct > 65:
+        sq -= 3; sq_r.append(f"Longs dominate L/S: {long_pct:.1f}% — long squeeze fuel")
+    elif long_pct > 60:
+        sq -= 2; sq_r.append(f"Long heavy: {long_pct:.1f}%")
+
+    # Funding rate — negative = shorts paying = short squeeze potential
+    if fr_val < -0.05:
+        sq += 3; sq_r.append(f"Extreme negative funding ({fr_val:.4f}%) → shorts underwater")
+    elif fr_val < -0.01:
+        sq += 2; sq_r.append(f"Negative funding ({fr_val:.4f}%) → short squeeze risk")
+    elif fr_val > 0.1:
+        sq -= 3; sq_r.append(f"Extreme positive funding ({fr_val:.4f}%) → longs paying → dump risk")
+    elif fr_val > 0.05:
+        sq -= 2; sq_r.append(f"High funding ({fr_val:.4f}%) → long squeeze risk")
+
+    # Funding trend — if recent rates moving toward negative while short-heavy = building pressure
+    if fund and len(fund) >= 3:
+        rates = [float(f.get("fundingRate", 0)) * 100 for f in fund]
+        trend_dir = rates[-1] - rates[0]
+        if trend_dir < -0.03 and sq > 0:
+            sq += 1; sq_r.append("Funding falling (more negative) → pressure building on shorts")
+        elif trend_dir > 0.03 and sq < 0:
+            sq -= 1; sq_r.append("Funding rising → more long squeeze pressure")
+
+    # OI trend — rising OI while price at lows = new shorts being added = more squeeze fuel
+    if oih and len(oih) >= 3:
+        ov = [float(x.get("sumOpenInterest", 0)) for x in oih]
+        oi_chg = (ov[-1] - ov[0]) / ov[0] * 100 if ov[0] else 0
+        rsi_1h = i1h.get("rsi") if i1h else 50
+        rsi_4h = i4h.get("rsi") if i4h else 50
+        if oi_chg > 8 and (rsi_1h or 50) < 40:
+            sq += 2; sq_r.append(f"OI rising +{oi_chg:.1f}% while RSI oversold → new shorts trapped")
+        elif oi_chg > 5 and sq > 0:
+            sq += 1; sq_r.append(f"OI expanding +{oi_chg:.1f}% — more short exposure")
+        elif oi_chg < -8 and (rsi_1h or 50) > 65:
+            sq -= 2; sq_r.append(f"OI dropping {oi_chg:.1f}% while RSI overbought → long deleveraging")
+
+    # Taker buy pressure at lows = smart money accumulating
+    if taker and isinstance(taker, list) and taker:
+        tb = float(taker[0].get("buySell", 1))
+        if tb > 1.15 and sq > 0:
+            sq += 1; sq_r.append(f"Taker buy ratio {tb:.2f}x — smart money buying the low")
+        elif tb < 0.85 and sq < 0:
+            sq -= 1; sq_r.append(f"Taker sell ratio {1/tb:.2f}x — selling into highs")
+
+    result["squeeze_score"] = max(-10, min(10, sq))
+    result["squeeze_reasons"] = sq_r
+
+    if sq >= 4:
+        result["squeeze_type"] = "SHORT_SQUEEZE"
+    elif sq <= -4:
+        result["squeeze_type"] = "LONG_SQUEEZE"
+
+    # ── 2. LIQUIDITY SWEEP DETECTION ─────────────────────────────────────────
+    sw_r = []
+    sweep = None
+
+    at1h = (i1h.get("at") if i1h else None) or price * 0.008
+    at4h = (i4h.get("at") if i4h else None) or price * 0.015
+    at1d = (i1d.get("at") if i1d else None) or price * 0.030
+
+    bl_4h = i4h.get("bl") if i4h else None   # BB lower 4H = dynamic support
+    bl_1d = i1d.get("bl") if i1d else None   # BB lower 1D = major support
+    bu_4h = i4h.get("bu") if i4h else None
+    bu_1d = i1d.get("bu") if i1d else None
+
+    rsi1h = (i1h.get("rsi") if i1h else None) or 50
+    rsi4h = (i4h.get("rsi") if i4h else None) or 50
+
+    # Check sweep below support (bullish reversal setup)
+    if bl_4h and price < bl_4h and rsi1h < 35:
+        sweep = "BELOW_SUPPORT"
+        sw_r.append(f"Price swept below 4H BB support ${fmt(bl_4h, 6)}")
+        sw_r.append(f"RSI1H oversold at {rsi1h:.0f} — exhaustion signal")
+    elif bl_1d and price < bl_1d and rsi4h < 40:
+        sweep = "BELOW_SUPPORT"
+        sw_r.append(f"Price swept below 1D BB support ${fmt(bl_1d, 6)} — major level breach")
+        sw_r.append(f"RSI4H at {rsi4h:.0f} — historically significant oversold")
+
+    # Check sweep above resistance (bearish reversal setup)
+    elif bu_4h and price > bu_4h and rsi1h > 70:
+        sweep = "ABOVE_RESISTANCE"
+        sw_r.append(f"Price swept above 4H BB resistance ${fmt(bu_4h, 6)}")
+        sw_r.append(f"RSI1H overbought {rsi1h:.0f} — exhaustion signal")
+    elif bu_1d and price > bu_1d and rsi4h > 68:
+        sweep = "ABOVE_RESISTANCE"
+        sw_r.append(f"Price swept above 1D BB resistance ${fmt(bu_1d, 6)} — major level breach")
+        sw_r.append(f"RSI4H at {rsi4h:.0f} — overbought on high TF")
+
+    # Wick analysis from recent klines — sweep candle = price went below then closed above
+    if ki1h and len(ki1h) >= 3:
+        last = ki1h[-1]; prev = ki1h[-2]
+        lo = float(last[3]); cl = float(last[4]); op = float(last[1]); hi = float(last[2])
+        lower_wick = min(op, cl) - lo
+        upper_wick = hi - max(op, cl)
+        body = abs(cl - op)
+        if lower_wick > body * 2.5 and cl > op:
+            sw_r.append(f"📍 Long lower wick on last 1H candle — liquidity sweep confirmed")
+            if not sweep: sweep = "BELOW_SUPPORT"
+        elif upper_wick > body * 2.5 and cl < op:
+            sw_r.append(f"📍 Long upper wick on last 1H candle — liquidity sweep above confirmed")
+            if not sweep: sweep = "ABOVE_RESISTANCE"
+
+    result["sweep_detected"] = sweep
+    result["sweep_reasons"] = sw_r
+
+    # ── 3. ESTIMATED LIQUIDATION CLUSTERS (price magnets) ─────────────────────
+    # Without Coinglass API, we estimate where liquidations pile up:
+    # - Shorts opened at recent highs get liquidated if price rises
+    # - Longs opened at recent lows get liquidated if price falls
+    # Use recent swing highs/lows + ATR-based levels
+
+    if ki4h and len(ki4h) >= 20:
+        highs_4h = [float(k[2]) for k in ki4h[-40:]]
+        lows_4h  = [float(k[3]) for k in ki4h[-40:]]
+
+        # Find swing highs (where shorts may have piled in)
+        # These are liquidation magnets ABOVE price
+        clusters_above = []
+        for i in range(2, len(highs_4h) - 2):
+            if highs_4h[i] > price and highs_4h[i] > highs_4h[i-1] and highs_4h[i] > highs_4h[i+1]:
+                dist_pct = (highs_4h[i] - price) / price * 100
+                if 1 < dist_pct < 60:
+                    clusters_above.append(round(highs_4h[i], 8))
+
+        # Find swing lows (where longs may have piled in)
+        clusters_below = []
+        for i in range(2, len(lows_4h) - 2):
+            if lows_4h[i] < price and lows_4h[i] < lows_4h[i-1] and lows_4h[i] < lows_4h[i+1]:
+                dist_pct = (price - lows_4h[i]) / price * 100
+                if 1 < dist_pct < 60:
+                    clusters_below.append(round(lows_4h[i], 8))
+
+        # Keep closest 3 on each side
+        result["liq_clusters_above"] = sorted(set(clusters_above))[:4]
+        result["liq_clusters_below"] = sorted(set(clusters_below), reverse=True)[:4]
+
+    # ── 4. SMC ORDER BLOCK DETECTION ─────────────────────────────────────────
+    # Order block = last opposing candle before a strong impulsive move
+    # Bullish OB = last bearish candle before a strong up move (demand zone)
+    # Bearish OB = last bullish candle before a strong down move (supply zone)
+    if ki4h and len(ki4h) >= 10:
+        ob = None
+        klines = ki4h[-30:]
+        for i in range(len(klines)-3, 1, -1):
+            o = float(klines[i][1]); c = float(klines[i][4])
+            n1c = float(klines[i+1][4]); n1o = float(klines[i+1][1])
+            n2c = float(klines[i+2][4]) if i+2 < len(klines) else n1c
+            move = abs(n1c - n1o)
+            atr_ref = at4h or price * 0.015
+
+            # Bullish OB: bearish candle (close < open) followed by 2 strong bullish candles
+            if c < o and n1c > n1o and move > atr_ref * 0.8 and n2c > n1c:
+                ob_low = min(o, c); ob_high = max(o, c)
+                if ob_high < price:   # OB is below current price = support OB
+                    ob = {"type": "BULLISH", "low": round(ob_low, 8), "high": round(ob_high, 8),
+                          "label": "Demand Zone (Bullish OB)"}
+                    break
+
+            # Bearish OB: bullish candle followed by 2 strong bearish candles
+            if c > o and n1c < n1o and move > atr_ref * 0.8 and n2c < n1c:
+                ob_low = min(o, c); ob_high = max(o, c)
+                if ob_low > price:   # OB is above current price = resistance OB
+                    ob = {"type": "BEARISH", "low": round(ob_low, 8), "high": round(ob_high, 8),
+                          "label": "Supply Zone (Bearish OB)"}
+                    break
+        result["order_block"] = ob
+
+    # ── 5. FINAL SETUP LABEL ─────────────────────────────────────────────────
+    sq_score = result["squeeze_score"]
+    setup_conf = 0
+
+    if sweep == "BELOW_SUPPORT" and sq_score >= 3:
+        result["setup_label"] = "🚀 SHORT SQUEEZE REVERSAL"
+        setup_conf = min(50 + sq_score * 5 + len(sw_r) * 5, 92)
+    elif sweep == "BELOW_SUPPORT" and sq_score >= 1:
+        result["setup_label"] = "📈 LIQUIDITY SWEEP LONG"
+        setup_conf = min(40 + sq_score * 5 + len(sw_r) * 4, 80)
+    elif sweep == "ABOVE_RESISTANCE" and sq_score <= -3:
+        result["setup_label"] = "💀 LONG SQUEEZE REVERSAL"
+        setup_conf = min(50 + abs(sq_score) * 5, 90)
+    elif sweep == "ABOVE_RESISTANCE" and sq_score <= -1:
+        result["setup_label"] = "📉 LIQUIDITY SWEEP SHORT"
+        setup_conf = min(40 + abs(sq_score) * 5, 80)
+    elif sq_score >= 5:
+        result["setup_label"] = "⚡ SHORT SQUEEZE BUILDING"
+        setup_conf = min(45 + sq_score * 4, 78)
+    elif sq_score <= -5:
+        result["setup_label"] = "⚡ LONG SQUEEZE BUILDING"
+        setup_conf = min(45 + abs(sq_score) * 4, 78)
+    elif result["liq_clusters_above"] and sq_score >= 2:
+        nearest_mag = result["liq_clusters_above"][0]
+        result["setup_label"] = f"🧲 LIQUIDITY MAGNET @ ${fmt(nearest_mag, 6)}"
+        setup_conf = 40
+
+    result["setup_confidence"] = setup_conf
+    return result
 def predict_ranges(price, i1h, i4h, i1d, i1w, weighted_score):
     """
     Predicted ranges from CURRENT price.
@@ -698,6 +938,12 @@ async def analyze(coin_raw):
         # Predicted ranges
         rngs=predict_ranges(price, i1h, i4h, i1d, i1w, weighted)
 
+        # Liquidity Hunt / Squeeze Detection
+        liq=liquidity_analysis(
+            price, i1h, i4h, i1d, ki1h, ki4h,
+            fr_val=fr_val, ls_data=ls, oih=oih, taker=taker, fund=fund
+        )
+
         # Trend
         tr4h=trend_detect(i4h); tr24h=trend_detect(i1d)
         at4h=i4h.get("at") or 0
@@ -727,6 +973,14 @@ async def analyze(coin_raw):
             "btc_price":float(btc_t.get("lastPrice",0)) if btc_t else 0,
             "fear_greed":fg["data"][0]["value"] if fg and "data" in fg else "N/A",
             "predicted_ranges":{k:{"h":v["h"],"l":v["l"],"mp":v["mp"]} for k,v in rngs.items()},
+            # Liquidity / squeeze / SMC analysis
+            "liquidity_setup": liq.get("setup_label"),
+            "squeeze_type": liq.get("squeeze_type"),
+            "squeeze_score": liq.get("squeeze_score"),
+            "sweep_detected": liq.get("sweep_detected"),
+            "liq_clusters_above": liq.get("liq_clusters_above",[])[:3],
+            "liq_clusters_below": liq.get("liq_clusters_below",[])[:3],
+            "order_block": liq.get("order_block"),
             # Baseline trade setups computed from quant signals — Groq should refine, not replace
             "baseline_spot":{
                 "action":action,"entry":ss["entry"],"sl":ss["sl"],
@@ -746,7 +1000,7 @@ async def analyze(coin_raw):
     # PAGE 1 — Overview + Price + Ranges
     p1=[]
     p1.append("━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
-    p1.append(f"🪙 *{coin}/USDT — Intelligence v11*")
+    p1.append(f"🪙 *{coin}/USDT — Intelligence v12*")
     p1.append(f"🕐 `{now}`")
     p1.append("━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
 
@@ -884,6 +1138,76 @@ async def analyze(coin_raw):
             if res>price: p2.append(f"  To 1D Res: `+{(res-price)/price*100:.2f}%`")
             if sup<price: p2.append(f"  To 1D Sup: `-{(price-sup)/price*100:.2f}%`")
 
+    # ── LIQUIDITY HUNT & SQUEEZE ANALYSIS ─────────────────────────────────────
+    p2.append(f"\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
+    p2.append(f"🧲 *LIQUIDITY HUNT ANALYSIS*")
+
+    liq_label = liq.get("setup_label","NO SETUP")
+    liq_conf  = liq.get("setup_confidence", 0)
+    sq_score  = liq.get("squeeze_score", 0)
+    sq_type   = liq.get("squeeze_type")
+
+    # Setup badge
+    if "SQUEEZE" in liq_label or "REVERSAL" in liq_label:
+        p2.append(f"  🚨 *Pattern: {liq_label}*")
+    elif "MAGNET" in liq_label or "SWEEP" in liq_label:
+        p2.append(f"  ⚡ *Pattern: {liq_label}*")
+    else:
+        p2.append(f"  ⬜ Pattern: `{liq_label}`")
+    if liq_conf > 0:
+        p2.append(f"  Pattern Confidence: `{liq_conf}%`")
+
+    # Squeeze meter
+    sq_bar = "🟩" * max(0, sq_score) + "🟥" * max(0, -sq_score) + "⬜" * (10 - abs(sq_score))
+    if sq_type == "SHORT_SQUEEZE":
+        p2.append(f"  Squeeze Meter: {sq_bar}")
+        p2.append(f"  🚀 *SHORT SQUEEZE POTENTIAL: {sq_score}/10*")
+    elif sq_type == "LONG_SQUEEZE":
+        p2.append(f"  Squeeze Meter: {sq_bar}")
+        p2.append(f"  💀 *LONG SQUEEZE POTENTIAL: {abs(sq_score)}/10*")
+    else:
+        p2.append(f"  Squeeze Pressure: `{sq_score:+d}/10`")
+
+    # Squeeze reasons
+    for r in liq.get("squeeze_reasons",[])[:3]:
+        p2.append(f"    • {r}")
+
+    # Liquidity sweep
+    sweep = liq.get("sweep_detected")
+    if sweep:
+        sw_emoji = "⬇️" if sweep=="BELOW_SUPPORT" else "⬆️"
+        sw_lbl   = "Below Support (Long Setup)" if sweep=="BELOW_SUPPORT" else "Above Resistance (Short Setup)"
+        p2.append(f"\n  {sw_emoji} *Liquidity Sweep: {sw_lbl}*")
+        for r in liq.get("sweep_reasons",[])[:3]:
+            p2.append(f"    • {r}")
+
+    # Liquidation magnets (clusters)
+    ca = liq.get("liq_clusters_above",[])
+    cb = liq.get("liq_clusters_below",[])
+    if ca or cb:
+        p2.append(f"\n  🧲 *Estimated Liquidation Clusters*")
+        if ca:
+            p2.append(f"  Above (Short liq magnets):")
+            for lvl in ca[:3]:
+                dist = (lvl-price)/price*100
+                p2.append(f"    🔴 `${fmt(lvl,6)}` (+{dist:.1f}%) ← shorts liquidate here")
+        if cb:
+            p2.append(f"  Below (Long liq magnets):")
+            for lvl in cb[:3]:
+                dist = (price-lvl)/price*100
+                p2.append(f"    🟢 `${fmt(lvl,6)}` (-{dist:.1f}%) ← longs liquidate here")
+
+    # SMC Order Block
+    ob = liq.get("order_block")
+    if ob:
+        ob_emoji = "🟩" if ob["type"]=="BULLISH" else "🟥"
+        p2.append(f"\n  {ob_emoji} *SMC Order Block: {ob['label']}*")
+        p2.append(f"    Zone: `${fmt(ob['low'],6)}` — `${fmt(ob['high'],6)}`")
+        if ob["type"]=="BULLISH":
+            p2.append(f"    ↳ Price entering this zone = potential LONG entry")
+        else:
+            p2.append(f"    ↳ Price entering this zone = potential SHORT entry")
+
     # Trade setups
     p2.append(f"\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
     p2.append(f"🎯 *TRADE SETUPS*")
@@ -1003,10 +1327,10 @@ async def handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if cmd.lower() in ("start","help"):
         await update.message.reply_text(
-            "👋 *Crypto Intelligence Bot v11*\n\n"
+            "👋 *Crypto Intelligence Bot v12*\n\n"
             "Type `/` + any coin:\n"
             "• `/BTC` `/ETH` `/SOL` `/PEPE`\n\n"
-            "✅ *Key improvements v11:*\n"
+            "✅ *Key improvements v12:*\n"
             "• Confluence scoring (3 TF agreement)\n"
             "• ATR/BB-based SL/TP with R/R\n"
             "• Futures buffer-to-liquidation shown\n"
@@ -1018,7 +1342,7 @@ async def handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if not cmd: return
     msg=await update.message.reply_text(
-        f"⏳ *{cmd.upper()}/USDT Analysis v11*\n_~20 seconds_",
+        f"⏳ *{cmd.upper()}/USDT Analysis v12*\n_~20 seconds_",
         parse_mode="Markdown")
     try:
         pages=await analyze(cmd)
@@ -1037,8 +1361,7 @@ def main():
     app.add_handler(CommandHandler("start",handler))
     app.add_handler(CommandHandler("help",handler))
     app.add_handler(MessageHandler(filters.COMMAND,handler))
-    logger.info("🚀 Crypto Intelligence Bot v11 started!")
+    logger.info("🚀 Crypto Intelligence Bot v12 started!")
     app.run_polling(allowed_updates=Update.ALL_TYPES)
 
 if __name__=="__main__":
-    main()
