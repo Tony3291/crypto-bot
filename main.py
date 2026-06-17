@@ -795,7 +795,8 @@ def guess_symbol_from_text(text: str) -> str | None:
     words = [w for w in text.split() if 2 <= len(w) <= 10 and w.isalpha()]
     return words[0] if words else None
 
-
+# ---- MAIN ANALYSIS ----
+async def analyze(coin_raw):
     coin = coin_raw.upper().strip().lstrip("/")
     if coin.endswith("USDT"): coin = coin[:-4]
     sym  = coin + "USDT"
