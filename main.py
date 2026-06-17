@@ -11,6 +11,7 @@ import asyncio
 import aiohttp
 import json
 import math
+import base64
 from datetime import datetime
 
 from telegram import Update
@@ -716,8 +717,85 @@ async def scan_futures(session, top_n=150):
     setups.sort(key=lambda x: x["score"], reverse=True)
     return setups[:8]  # top 8 setups
 
-# ---- MAIN ANALYSIS ----
-async def analyze(coin_raw):
+# ---- CHART IMAGE ANALYSIS (Groq Vision) ----
+async def analyze_chart_image(session, image_b64: str) -> dict | None:
+    """
+    Send chart screenshot to Groq's vision model.
+    Extracts: coin symbol, visible pattern, trend, key levels drawn on chart.
+    """
+    prompt = (
+        "You are an expert technical chart reader (SMC/ICT + classic TA). "
+        "Look at this trading chart screenshot carefully.\n\n"
+        "Identify:\n"
+        "1. The coin/symbol shown (look for ticker text, e.g. BTCUSDT, ETHUSDT)\n"
+        "2. The exchange/platform if visible\n"
+        "3. The timeframe if visible (1m,5m,15m,1h,4h,1d etc)\n"
+        "4. Visible chart pattern (head & shoulders, triangle, flag, double top/bottom, "
+        "channel, wedge, etc) if any\n"
+        "5. Visible SMC/ICT elements (order blocks, FVG, liquidity zones, "
+        "support/resistance lines, trendlines) if drawn\n"
+        "6. Overall visual trend direction (uptrend/downtrend/sideways) based on candle structure\n"
+        "7. Any indicators visible (RSI, MACD, EMA, Bollinger Bands) and their visual state\n\n"
+        "Reply ONLY with this JSON (no markdown, no extra text):\n"
+        '{"symbol":"BTCUSDT","timeframe":"4h","pattern":"description or null",'
+        '"trend":"UPTREND/DOWNTREND/SIDEWAYS","smc_elements":["element1","element2"],'
+        '"indicators_seen":["RSI","MACD"],"visual_bias":"BULLISH/BEARISH/NEUTRAL",'
+        '"notes":"1-2 sentence summary of what you see"}\n\n'
+        "If you cannot identify the symbol with confidence, set symbol to null. "
+        "Be precise about the ticker text if visible."
+    )
+
+    h = {"Authorization": f"Bearer {GROQ_API_KEY}", "Content-Type": "application/json"}
+    body = {
+        "model": "llama-3.2-90b-vision-preview",
+        "messages": [
+            {
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": prompt},
+                    {"type": "image_url",
+                     "image_url": {"url": f"data:image/jpeg;base64,{image_b64}"}},
+                ],
+            }
+        ],
+        "max_tokens": 600,
+        "temperature": 0.2,
+    }
+    resp = await post_req(session, GROQ, h, body, timeout=40)
+    if not resp or "choices" not in resp:
+        logger.warning("Groq vision failed, trying fallback model")
+        # Fallback to scout model if vision-preview deprecated
+        body["model"] = "llama-3.2-11b-vision-preview"
+        resp = await post_req(session, GROQ, h, body, timeout=40)
+        if not resp or "choices" not in resp:
+            return None
+
+    raw = resp["choices"][0]["message"]["content"].strip()
+    start = raw.find("{"); end = raw.rfind("}")
+    if start == -1 or end == -1:
+        return None
+    raw = raw[start:end+1]
+    try:
+        return json.loads(raw)
+    except Exception:
+        try:
+            raw = raw.replace("'", '"').replace("True", "true").replace("False", "false")
+            return json.loads(raw)
+        except Exception:
+            logger.warning("Vision JSON parse failed: %s", raw[:150])
+            return None
+
+def guess_symbol_from_text(text: str) -> str | None:
+    """Try to extract a coin symbol from caption text"""
+    if not text:
+        return None
+    text = text.upper().strip()
+    for tok in ["/", "USDT", "PERP", "-", " "]:
+        text = text.replace(tok, " ")
+    words = [w for w in text.split() if 2 <= len(w) <= 10 and w.isalpha()]
+    return words[0] if words else None
+
+
     coin = coin_raw.upper().strip().lstrip("/")
     if coin.endswith("USDT"): coin = coin[:-4]
     sym  = coin + "USDT"
@@ -1108,16 +1186,21 @@ async def handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if cmd.lower() in ("start", "help"):
         await update.message.reply_text(
-            "*Crypto Intelligence Bot v11*\n\n"
+            "*Crypto Intelligence Bot v12*\n\n"
             "Commands:\n"
             "/BTC /ETH /SOL /PEPE — full analysis\n"
             "/scan — scan all futures for OB/SMC setups\n\n"
+            "Send a chart screenshot (photo) and the bot will:\n"
+            "- Read the chart with Groq Vision\n"
+            "- Detect coin, pattern, trend, SMC elements\n"
+            "- Pull live Binance data for that coin\n"
+            "- Run full spot + futures analysis on it\n\n"
             "Features:\n"
             "- Directional price prediction (LONG/SHORT)\n"
             "- SMC/ICT: OB, FVG, BOS, CHOCH\n"
             "- Spot + Futures 25x setup\n"
             "- CryptoPanic news\n"
-            "- Groq AI analysis",
+            "- Groq AI text + vision analysis",
             parse_mode="Markdown")
         return
 
@@ -1142,13 +1225,111 @@ async def handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         try: await msg.edit_text(f"Error: {str(e)[:200]}")
         except Exception: pass
 
+# ---- PHOTO / CHART HANDLER ----
+async def photo_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.effective_chat.id != ALLOWED_CHAT:
+        return
+
+    msg = await update.message.reply_text(
+        "Reading chart image with Groq Vision...",
+        parse_mode="Markdown")
+
+    try:
+        photo = update.message.photo[-1]   # highest resolution
+        file = await context.bot.get_file(photo.file_id)
+        photo_bytes = await file.download_as_bytearray()
+        image_b64 = base64.b64encode(bytes(photo_bytes)).decode("utf-8")
+
+        conn = aiohttp.TCPConnector(ssl=False, limit=10)
+        async with aiohttp.ClientSession(connector=conn) as s:
+            vision = await analyze_chart_image(s, image_b64)
+
+        if not vision:
+            await msg.edit_text(
+                "Could not read the chart. Groq Vision unavailable or image unclear.\n"
+                "Try sending the coin symbol directly, e.g. /BTC",
+                parse_mode="Markdown")
+            return
+
+        symbol = vision.get("symbol")
+        caption = update.message.caption or ""
+
+        # Fallback: try to guess from caption if vision didn't find symbol
+        if not symbol or symbol.lower() == "null":
+            symbol = guess_symbol_from_text(caption)
+
+        # Show what the bot read from the chart first
+        lines = ["*CHART READING (Groq Vision)*"]
+        lines.append("---")
+        lines.append(f"  Symbol detected: `{symbol or 'UNKNOWN'}`")
+        if vision.get("timeframe"):
+            lines.append(f"  Timeframe: `{vision['timeframe']}`")
+        if vision.get("pattern"):
+            lines.append(f"  Pattern: {vision['pattern']}")
+        if vision.get("trend"):
+            lines.append(f"  Visual Trend: *{vision['trend']}*")
+        if vision.get("smc_elements"):
+            lines.append(f"  SMC Elements: {', '.join(vision['smc_elements'][:4])}")
+        if vision.get("indicators_seen"):
+            lines.append(f"  Indicators Seen: {', '.join(vision['indicators_seen'])}")
+        if vision.get("visual_bias"):
+            lines.append(f"  Visual Bias: *{vision['visual_bias']}*")
+        if vision.get("notes"):
+            lines.append(f"  Notes: {vision['notes']}")
+
+        await msg.edit_text("\n".join(lines), parse_mode="Markdown")
+
+        if not symbol:
+            await update.message.reply_text(
+                "Could not determine the coin symbol from the chart.\n"
+                "Reply with the coin name (e.g. send /BTC) or add a caption with the ticker.",
+                parse_mode="Markdown")
+            return
+
+        # Run the full real-data analysis pipeline on the detected symbol
+        msg2 = await update.message.reply_text(
+            f"Running full live analysis on {symbol.upper()}/USDT using Binance data...\n(~25 sec)",
+            parse_mode="Markdown")
+        try:
+            pages = await analyze(symbol)
+            await msg2.delete()
+
+            # Prepend a note that this combines chart vision + live data
+            intro = (
+                f"*COMBINED ANALYSIS: Chart Vision + Live Binance Data*\n"
+                f"Visual bias from your chart: *{vision.get('visual_bias','N/A')}*\n"
+                f"Live confluence below confirms or contradicts this:"
+            )
+            await update.message.reply_text(intro, parse_mode="Markdown")
+
+            for i, page in enumerate(pages):
+                if page.strip():
+                    await update.message.reply_text(page.strip(), parse_mode="Markdown")
+                    if i < len(pages) - 1:
+                        await asyncio.sleep(0.5)
+        except Exception as e:
+            logger.error("Chart->analyze error: %s", e, exc_info=True)
+            try:
+                await msg2.edit_text(f"Could not fetch live data for {symbol}: {str(e)[:150]}")
+            except Exception:
+                pass
+
+    except Exception as e:
+        logger.error("Photo handler error: %s", e, exc_info=True)
+        try:
+            await msg.edit_text(f"Error reading chart: {str(e)[:150]}")
+        except Exception:
+            pass
+
+
 def main():
     app = ApplicationBuilder().token(TELEGRAM_TOKEN).build()
     app.add_handler(CommandHandler("start", handler))
     app.add_handler(CommandHandler("help",  handler))
     app.add_handler(CommandHandler("scan",  run_scan))
+    app.add_handler(MessageHandler(filters.PHOTO, photo_handler))
     app.add_handler(MessageHandler(filters.COMMAND, handler))
-    logger.info("Crypto Intelligence Bot v11 started")
+    logger.info("Crypto Intelligence Bot v12 started")
     app.run_polling(allowed_updates=Update.ALL_TYPES)
 
 if __name__ == "__main__":
